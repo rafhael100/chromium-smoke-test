@@ -10,27 +10,123 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
-      - name: Render a local fixture and check the browser sandbox
+      - name: Verify kernel restrictions on live Chromium renderers
         shell: bash
         run: |
           set -euo pipefail
-          export LC_ALL=C
-          chrome="$(command -v google-chrome || command -v google-chrome-stable)"
-          "$chrome" --version
-          work="$(mktemp -d)"
-          cd "$work"
-          printf '%s\n' '<!doctype html><title>Synthetic fixture</title><p id="marker"></p><script>document.querySelector("#marker").textContent = "synthetic-" + "render-ok";</script>' > index.html
-          python3 -m http.server 18739 --bind 127.0.0.1 > http.log 2>&1 &
-          server=$!
-          trap 'kill "$server" 2>/dev/null || true; rm -rf "$work"' EXIT
-          curl --fail --silent --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18739/ >/dev/null
-          flags=(--headless --no-first-run --no-default-browser-check --disable-background-networking --dump-dom)
-          timeout 30 "$chrome" "${flags[@]}" --user-data-dir="$work/fixture" http://127.0.0.1:18739/ > fixture.html
-          grep -Fq '<p id="marker">synthetic-render-ok</p>' fixture.html
-          echo 'PASS: loopback fixture rendered and JavaScript executed.'
-          timeout 30 "$chrome" "${flags[@]}" --user-data-dir="$work/diagnostic" chrome://sandbox/ > sandbox.html
-          if ! grep -Fiq 'You are adequately sandboxed' sandbox.html; then
-            echo 'FAIL: Chromium did not confirm an adequate renderer sandbox.' >&2
-            exit 1
-          fi
-          echo 'PASS: Chromium reports an adequate renderer sandbox.'
+          python3 -u - <<'PY'
+          import http.server
+          import os
+          from pathlib import Path
+          import shutil
+          import subprocess
+          import tempfile
+          import threading
+          import time
+
+          rendered = threading.Event()
+          page = b'''<!doctype html><title>Synthetic fixture</title>
+          <p id="marker"></p><script>
+          document.querySelector('#marker').textContent = 'synthetic-render-ok';
+          fetch('/rendered', {method: 'POST'});
+          </script>'''
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def log_message(self, *_):
+                  pass
+
+              def do_GET(self):
+                  if self.path != '/':
+                      self.send_error(404)
+                      return
+                  self.send_response(200)
+                  self.send_header('Content-Type', 'text/html; charset=utf-8')
+                  self.send_header('Content-Length', str(len(page)))
+                  self.end_headers()
+                  self.wfile.write(page)
+
+              def do_POST(self):
+                  if self.path != '/rendered':
+                      self.send_error(404)
+                      return
+                  self.send_response(204)
+                  self.end_headers()
+                  rendered.set()
+
+          def status(pid):
+              return dict(line.split(':', 1) for line in Path(f'/proc/{pid}/status').read_text().splitlines())
+
+          def metrics(fields):
+              return (int(fields['Seccomp']), int(fields['Seccomp_filters']),
+                      int(fields['NoNewPrivs']), len(fields['NSpid'].split()),
+                      int(fields['CapEff'], 16))
+
+          def protected(renderer, browser):
+              mode, filters, no_new_privs, pid_depth, caps = renderer
+              return (mode == 2 and filters > browser[1] and no_new_privs == 1
+                      and pid_depth > browser[3] and caps == 0)
+
+          def renderer_metrics(root):
+              children = {}
+              for entry in Path('/proc').iterdir():
+                  if not entry.name.isdigit():
+                      continue
+                  try:
+                      parent = int(status(entry.name)['PPid'])
+                  except OSError:
+                      continue
+                  children.setdefault(parent, []).append(int(entry.name))
+              pending = list(children.get(root, []))
+              results = []
+              while pending:
+                  pid = pending.pop()
+                  pending.extend(children.get(pid, []))
+                  try:
+                      args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+                      if b'--type=renderer' in args:
+                          results.append(metrics(status(pid)))
+                  except FileNotFoundError:
+                      continue
+              return results
+
+          if os.geteuid() == 0:
+              raise SystemExit('FAIL: this test requires an unprivileged account')
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable')
+          if not chrome:
+              raise SystemExit('FAIL: Google Chrome is not installed')
+          subprocess.run([chrome, '--version'], check=True)
+          with http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+              threading.Thread(target=server.serve_forever, daemon=True).start()
+              with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryFile() as diagnostics:
+                  cmd = [chrome, '--headless', '--no-first-run', '--no-default-browser-check',
+                         '--disable-background-networking', f'--user-data-dir={profile}',
+                         f'http://127.0.0.1:{server.server_port}/']
+                  with subprocess.Popen(cmd, stdout=diagnostics, stderr=diagnostics) as browser:
+                      try:
+                          if not rendered.wait(25) or browser.poll() is not None:
+                              raise SystemExit('FAIL: no JavaScript acknowledgement from fixture')
+                          print('PASS: loopback page executed JavaScript in the measured browser', flush=True)
+                          baseline = metrics(status(browser.pid))
+                          deadline = time.monotonic() + 8
+                          while True:
+                              samples = renderer_metrics(browser.pid)
+                              if samples and all(protected(s, baseline) for s in samples):
+                                  break
+                              if time.monotonic() >= deadline or browser.poll() is not None:
+                                  print(f'Browser baseline: {baseline}; renderer samples: {samples}', flush=True)
+                                  raise SystemExit('FAIL: required renderer isolation was not verified')
+                              time.sleep(0.2)
+                          print(f'Browser baseline: {baseline}', flush=True)
+                          print('Renderer fields: Seccomp, filters, NoNewPrivs, PID namespace depth, effective capabilities')
+                          print(f'Renderer samples: {samples}')
+                          print('PASS: renderer seccomp, PID isolation and privilege restrictions verified')
+                      finally:
+                          if browser.poll() is None:
+                              browser.terminate()
+                              try:
+                                  browser.wait(timeout=5)
+                              except subprocess.TimeoutExpired:
+                                  browser.kill()
+                                  browser.wait()
+                          server.shutdown()
+          PY
