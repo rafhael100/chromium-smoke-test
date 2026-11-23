@@ -1,0 +1,36 @@
+name: Chromium sandbox smoke test
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/chromium-smoke.yml']
+  workflow_dispatch:
+permissions: {}
+jobs:
+  sandbox:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Render a local fixture and check the browser sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          chrome="$(command -v google-chrome || command -v google-chrome-stable)"
+          "$chrome" --version
+          work="$(mktemp -d)"
+          cd "$work"
+          printf '%s\n' '<!doctype html><title>Synthetic fixture</title><p id="marker"></p><script>document.querySelector("#marker").textContent = "synthetic-" + "render-ok";</script>' > index.html
+          python3 -m http.server 18739 --bind 127.0.0.1 > http.log 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true; rm -rf "$work"' EXIT
+          curl --fail --silent --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18739/ >/dev/null
+          flags=(--headless --no-first-run --no-default-browser-check --disable-background-networking --dump-dom)
+          timeout 30 "$chrome" "${flags[@]}" --user-data-dir="$work/fixture" http://127.0.0.1:18739/ > fixture.html
+          grep -Fq '<p id="marker">synthetic-render-ok</p>' fixture.html
+          echo 'PASS: loopback fixture rendered and JavaScript executed.'
+          timeout 30 "$chrome" "${flags[@]}" --user-data-dir="$work/diagnostic" chrome://sandbox/ > sandbox.html
+          if ! grep -Fiq 'You are adequately sandboxed' sandbox.html; then
+            echo 'FAIL: Chromium did not confirm an adequate renderer sandbox.' >&2
+            exit 1
+          fi
+          echo 'PASS: Chromium reports an adequate renderer sandbox.'
