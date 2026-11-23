@@ -16,6 +16,7 @@ jobs:
           set -euo pipefail
           python3 -u - <<'PY'
           import http.server
+          import json
           import os
           from pathlib import Path
           import shutil
@@ -66,28 +67,21 @@ jobs:
               return (mode == 2 and filters > browser[1] and no_new_privs == 1
                       and pid_depth > browser[3] and caps == 0)
 
-          def renderer_metrics(root):
-              children = {}
-              for entry in Path('/proc').iterdir():
-                  if not entry.name.isdigit():
-                      continue
-                  try:
-                      parent = int(status(entry.name)['PPid'])
-                  except OSError:
-                      continue
-                  children.setdefault(parent, []).append(int(entry.name))
-              pending = list(children.get(root, []))
-              results = []
-              while pending:
-                  pid = pending.pop()
-                  pending.extend(children.get(pid, []))
-                  try:
-                      args = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
-                      if b'--type=renderer' in args:
-                          results.append(metrics(status(pid)))
-                  except FileNotFoundError:
-                      continue
-              return results
+          def renderer_metrics(profile, expected_browser):
+              # Chrome creates this file only in this disposable profile.
+              port, path = (Path(profile) / 'DevToolsActivePort').read_text().splitlines()
+              if not port.isdecimal() or not path.startswith('/devtools/browser/'):
+                  raise SystemExit('FAIL: unexpected local DevTools address')
+              ws = f'ws://127.0.0.1:{port}{path}'
+              data = subprocess.run(['node', '--experimental-websocket', '-e', "const socket = new WebSocket(process.argv[1]);\nconst timer = setTimeout(() => process.exit(2), 2500);\nsocket.addEventListener('open', () => socket.send(JSON.stringify({id: 1, method: 'SystemInfo.getProcessInfo'})));\nsocket.addEventListener('error', () => process.exit(3));\nsocket.addEventListener('message', event => {\n  const msg = JSON.parse(event.data);\n  if (msg.id !== 1) return;\n  if (!Array.isArray(msg.result?.processInfo)) process.exit(4);\n  clearTimeout(timer);\n  console.log(JSON.stringify(msg.result.processInfo.map(({type,id}) => ({type,id}))));\n  socket.close();\n});", ws],
+                                    check=True, capture_output=True, timeout=4, text=True)
+              info = json.loads(data.stdout)
+              if not any(x['type'].lower() == 'browser' and x['id'] == expected_browser for x in info):
+                  raise SystemExit('FAIL: Chromium did not identify the expected browser process')
+              ids = [x['id'] for x in info if x['type'].lower() == 'renderer']
+              if not all(isinstance(pid, int) and pid > 0 and pid != expected_browser for pid in ids):
+                  raise SystemExit('FAIL: invalid renderer process identifier')
+              return [metrics(status(pid)) for pid in ids]
 
           if os.geteuid() == 0:
               raise SystemExit('FAIL: this test requires an unprivileged account')
@@ -99,7 +93,8 @@ jobs:
               threading.Thread(target=server.serve_forever, daemon=True).start()
               with tempfile.TemporaryDirectory() as profile, tempfile.TemporaryFile() as diagnostics:
                   cmd = [chrome, '--headless', '--no-first-run', '--no-default-browser-check',
-                         '--disable-background-networking', f'--user-data-dir={profile}',
+                         '--disable-background-networking', '--remote-debugging-address=127.0.0.1',
+                         '--remote-debugging-port=0', f'--user-data-dir={profile}',
                          f'http://127.0.0.1:{server.server_port}/']
                   with subprocess.Popen(cmd, stdout=diagnostics, stderr=diagnostics) as browser:
                       try:
@@ -109,7 +104,10 @@ jobs:
                           baseline = metrics(status(browser.pid))
                           deadline = time.monotonic() + 8
                           while True:
-                              samples = renderer_metrics(browser.pid)
+                              try:
+                                  samples = renderer_metrics(profile, browser.pid)
+                              except FileNotFoundError:
+                                  samples = []
                               if samples and all(protected(s, baseline) for s in samples):
                                   break
                               if time.monotonic() >= deadline or browser.poll() is not None:
@@ -117,6 +115,7 @@ jobs:
                                   raise SystemExit('FAIL: required renderer isolation was not verified')
                               time.sleep(0.2)
                           print(f'Browser baseline: {baseline}', flush=True)
+                          print('Source of renderer PIDs: Chromium SystemInfo, cross-checked against /proc')
                           print('Renderer fields: Seccomp, filters, NoNewPrivs, PID namespace depth, effective capabilities')
                           print(f'Renderer samples: {samples}')
                           print('PASS: renderer seccomp, PID isolation and privilege restrictions verified')
